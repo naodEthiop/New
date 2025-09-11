@@ -1,0 +1,232 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+    
+    function isValidEmail(email) {
+      return email.matches('^[^@]+@[^@]+\\.[^@]+$');
+    }
+    
+    function isValidAmount(amount) {
+      return amount is number && amount >= 0 && amount <= 50000; // Upper limit for safety
+    }
+    
+    function isValidGameStatus(status) {
+      return status in ['waiting', 'active', 'completed', 'cancelled'];
+    }
+    
+    function isValidTransactionStatus(status) {
+      return status in ['pending', 'completed', 'failed'];
+    }
+    
+    function isValidTransactionType(type) {
+      return type in ['deposit', 'withdrawal', 'game_entry', 'game_win', 'bonus', 'transfer'];
+    }
+    
+    function isValidTicketStatus(status) {
+      return status in ['open', 'in_progress', 'resolved', 'closed'];
+    }
+    
+    function isValidTicketPriority(priority) {
+      return priority in ['low', 'medium', 'high'];
+    }
+
+    // Profile fetch is always by UID, so no composite index needed
+    match /users/{userId} {
+      // Allow authenticated users (including anonymous) to read/update their own profile
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow update: if isAuthenticated() && request.auth.uid == userId;
+
+      // Allow profile creation:
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && (
+          // If email exists, require verification and validation
+          (
+            ('email' in request.resource.data)
+            && request.resource.data.email is string
+            && request.resource.data.email == request.auth.token.email
+            && request.resource.data.email.matches('^[^@]+@[^@]+\\.[^@]+$')
+            && request.resource.data.displayName is string
+            && request.resource.data.displayName.size() > 2
+            && !(('isAdmin' in request.resource.data) && request.resource.data.isAdmin == true)
+          )
+          // If no email (anonymous), allow minimal profile creation
+          || (
+            !('email' in request.resource.data)
+            && request.resource.data.displayName is string
+            && request.resource.data.displayName.size() > 2
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // Wallets collection - Enforce email verification
+    match /wallets/{walletId} {
+      allow read: if isAuthenticated() && (walletId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && walletId == request.auth.uid &&
+        request.auth.token.email_verified == true &&
+        isValidAmount(request.resource.data.balance);
+      allow update: if isAuthenticated() && (walletId == request.auth.uid || isAdmin()) &&
+        request.auth.token.email_verified == true &&
+        isValidAmount(request.resource.data.balance);
+      allow delete: if isAdmin();
+    }
+
+    // Games collection
+    match /games/{gameId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && 
+        request.auth.token.email_verified == true &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.players.hasAny([request.auth.uid]) &&
+        isValidGameStatus(request.resource.data.status) &&
+        isValidAmount(request.resource.data.entryFee) &&
+        request.resource.data.maxPlayers is number &&
+        request.resource.data.maxPlayers >= 2 &&
+        request.resource.data.maxPlayers <= 50;
+      allow update: if isAuthenticated() && 
+        (request.resource.data.createdBy == request.auth.uid || isAdmin()) &&
+        request.auth.token.email_verified == true &&
+        isValidGameStatus(request.resource.data.status);
+      allow delete: if isAdmin();
+    }
+
+    // Game rooms collection (for real-time game state)
+    match /gameRooms/{roomId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && 
+        request.auth.token.email_verified == true &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.players.hasAny([request.auth.uid]);
+      allow update: if isAuthenticated() && 
+        (request.auth.uid == resource.data.createdBy || isAdmin()) &&
+        request.auth.token.email_verified == true;
+      allow delete: if isAdmin();
+    }
+
+    // Transactions collection - Enforce amount upper limit
+    match /transactions/{transactionId} {
+      allow read: if isAuthenticated() && 
+        (request.auth.uid == resource.data.userId || isAdmin());
+      allow create: if isAuthenticated() && 
+        request.auth.token.email_verified == true &&
+        request.resource.data.userId == request.auth.uid &&
+        isValidTransactionType(request.resource.data.type) &&
+        isValidTransactionStatus(request.resource.data.status) &&
+        isValidAmount(request.resource.data.amount);
+      allow update: if isAdmin() && 
+        isValidTransactionStatus(request.resource.data.status) &&
+        isValidAmount(request.resource.data.amount);
+      allow delete: if isAdmin();
+    }
+
+    // Support tickets collection
+    match /support_tickets/{ticketId} {
+      allow read: if isAuthenticated() && 
+        (request.auth.uid == resource.data.userId || isAdmin());
+      allow create: if isAuthenticated() && 
+        request.auth.token.email_verified == true &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.subject is string &&
+        request.resource.data.subject.size() > 0 &&
+        request.resource.data.subject.size() <= 200 &&
+        request.resource.data.message is string &&
+        request.resource.data.message.size() > 0 &&
+        request.resource.data.message.size() <= 2000 &&
+        isValidTicketStatus(request.resource.data.status) &&
+        isValidTicketPriority(request.resource.data.priority);
+      allow update: if isAuthenticated() && 
+        (request.auth.uid == resource.data.userId || isAdmin()) &&
+        request.auth.token.email_verified == true &&
+        isValidTicketStatus(request.resource.data.status) &&
+        isValidTicketPriority(request.resource.data.priority);
+      allow delete: if isAdmin();
+    }
+
+    // Admin logs collection
+    match /admin_logs/{logId} {
+      allow read, write: if isAdmin();
+    }
+
+    // System settings collection
+    match /system_settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Leaderboards collection (aggregated, non-sensitive)
+    match /leaderboards/{leaderboardId} {
+      // Allow public read for showcasing
+      allow read: if true;
+      // Only admins can create/update/delete leaderboard documents
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Payment webhooks collection
+    match /payment_webhooks/{webhookId} {
+      allow read, write: if isAdmin();
+    }
+
+    // User sessions collection
+    match /user_sessions/{sessionId} {
+      allow read, write: if isAuthenticated() && 
+        request.auth.uid == resource.data.userId;
+    }
+
+    // Game statistics collection
+    match /game_stats/{statId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Chat messages collection (if implementing in-game chat)
+    match /chat_messages/{messageId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && 
+        request.auth.token.email_verified == true &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.message is string &&
+        request.resource.data.message.size() > 0 &&
+        request.resource.data.message.size() <= 500;
+      allow update, delete: if isAuthenticated() && 
+        (request.auth.uid == resource.data.userId || isAdmin()) &&
+        request.auth.token.email_verified == true;
+    }
+
+    // Voice settings collection
+    match /voice_settings/{userId} {
+      allow read, write: if isAuthenticated() && isOwner(userId);
+    }
+
+    // Achievement collection
+    match /achievements/{achievementId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // User achievements collection
+    match /user_achievements/{userAchievementId} {
+      allow read: if isAuthenticated() && 
+        (request.auth.uid == resource.data.userId || isAdmin());
+      allow write: if isAuthenticated() && 
+        request.auth.token.email_verified == true &&
+        request.resource.data.userId == request.auth.uid;
+    }
+    // Note: Rate limiting and soft deletes should be handled in backend or via Cloud Functions.
+  }
+}
