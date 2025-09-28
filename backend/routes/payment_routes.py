@@ -108,24 +108,6 @@ def initiate_payment():
             "error": str(e)
         }), 500
 
-@payment_bp.route('/create-payment', methods=['POST'])
-def create_payment():
-    """Create a Chapa payment (legacy endpoint)"""
-    data = request.json
-    if not data:
-        return jsonify({"error": "No JSON data provided"}), 400
-    
-    try:
-        # Initialize Chapa service (you'll need to pass config)
-        # This is a placeholder - you'll need to pass the actual config
-        from config.settings import get_config
-        config = get_config()
-        chapa_service = ChapaService(config)
-        result = chapa_service.create_payment(data)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 @payment_bp.route('/wallet/deposit', methods=['POST'])
 @require_auth
 def wallet_deposit():
